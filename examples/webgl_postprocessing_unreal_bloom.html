@@ -4,18 +4,11 @@
 		<title>three.js - Schwarzschild line-path study</title>
 		<meta charset="utf-8">
 		<meta name="viewport" content="width=device-width, user-scalable=no, minimum-scale=1.0, maximum-scale=1.0">
-		<link rel="icon" href="data:,">
 		<link type="text/css" rel="stylesheet" href="main.css">
 	</head>
 	<body>
 		<div id="container"></div>
 		<div id="info"><a href="https://threejs.org" target="_blank" rel="noopener">three.js</a> - Schwarzschild-lensed line paths<br>drag to orbit · wheel or pinch to zoom</div>
-		<script>
-			if ( [ 'localhost', '127.0.0.1', '::1' ].includes( location.hostname ) ) {
-				const liveReload = new EventSource( '/__live_reload' );
-				liveReload.addEventListener( 'change', () => location.reload() );
-			}
-		</script>
 		<script type="importmap">
 			{ "imports": { "three": "../build/three.module.js", "three/addons/": "./jsm/" } }
 		</script>
@@ -28,20 +21,16 @@
 			import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
 			import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
 			import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
-			import { createRealismLensingMaterial, loadRealismLensingTextures } from './realism-lensing.js';
 
 			const STORAGE_KEY = 'schwarzschild-line-study-v1';
 			const defaults = Object.freeze( {
-				styleVersion: 10,
+				styleVersion: 7,
 				// Match the official Unreal Bloom example's visible defaults.
 				threshold: 0, strength: 1, radius: 0.5, exposure: 1,
 				lineCount: 22, lineThickness: 0.03, lineBrightness: 2.6,
 				diskInner: 2, diskWidth: 4, cameraDistance: 10.69,
 				inclination: 13.24, movementAngle: 12, fieldOfView: 68,
-				orbitSpeed: 0.96, resolutionScale: 1,
-				renderMode: 'realism', secondaryImage: 0.62, photonRing: 1.15,
-				relativisticLighting: 0.68, colorTemperature: 0.24, shadowDepth: 1,
-				starField: 0.36, starLensing: 0.94
+				orbitSpeed: 0.96, resolutionScale: 1
 			} );
 			const saved = JSON.parse( localStorage.getItem( STORAGE_KEY ) || '{}' );
 			const params = { ...defaults, ...saved };
@@ -55,15 +44,7 @@
 					lineCount: defaults.lineCount,
 					lineThickness: defaults.lineThickness,
 					lineBrightness: defaults.lineBrightness,
-					resolutionScale: defaults.resolutionScale,
-					renderMode: defaults.renderMode,
-					secondaryImage: defaults.secondaryImage,
-					photonRing: defaults.photonRing,
-					relativisticLighting: defaults.relativisticLighting,
-					colorTemperature: defaults.colorTemperature,
-					shadowDepth: defaults.shadowDepth,
-					starField: defaults.starField,
-					starLensing: defaults.starLensing
+					resolutionScale: defaults.resolutionScale
 				} );
 				localStorage.setItem( STORAGE_KEY, JSON.stringify( params ) );
 			}
@@ -72,12 +53,11 @@
 			const TAU = Math.PI * 2;
 
 			let renderer, composer, bloomPass, scene, mappingScene, camera, orbitCamera, orbitControls, stats;
-			let mappingMaterial, legacyMappingMaterial, realismMappingMaterial, mappingQuad, displayMaterial;
+			let mappingMaterial, displayMaterial;
 			let mappingTarget, fullMappingTarget, previewMappingTarget, rayMapFrame, fullQualityFrame;
 			let cameraSaveTimer, cameraSettleTimer, fullQualityVersion = 0;
 			let syncingOrbitCamera = false;
-			let realismReady = false;
-			let viewControllers = [], renderModeController, realismStatus;
+			let viewControllers = [];
 			let previousTime = performance.now();
 			const orbitUp = new THREE.Vector3();
 
@@ -194,45 +174,29 @@
 			// only move the disk texture through this cached UV map.
 			const displayFragmentShader = /* glsl */`
 				#define PI 3.141592653589793238462643383279
-				#define TAU 6.283185307179586476925286766559
 				varying vec2 vUv;
 				uniform float uTime;
 				uniform float uBrightness;
 				uniform float uLineCount;
 				uniform float uLineThickness;
-				uniform float uRealism;
-				uniform float uSecondaryImage;
-				uniform float uPhotonRing;
-				uniform float uRelativisticLighting;
-				uniform float uColorTemperature;
-				uniform float uStarField;
-				uniform float uStarLensing;
-				uniform float uShadowDepth;
-				uniform vec2 uStarViewOffset;
-				uniform float uCameraDistance;
-				uniform float uCameraAzimuth;
-				uniform float uFieldOfView;
-				uniform float uDiskInner;
-				uniform float uDiskWidth;
-				uniform vec2 uViewport;
 				uniform sampler2D uRayMap;
 
 				float random( float value ) {
 					return fract( sin( value * 12.9898 ) * 43758.5453 );
 				}
 
-				float random2( vec2 value ) {
-					return fract( sin( dot( value, vec2( 127.1, 311.7 ) ) ) * 43758.5453 );
-				}
-
-				float filamentMask( vec2 diskUv ) {
-					float validUv = step( 0.0, diskUv.y ) * step( diskUv.y, 1.0 );
-					float laneCoordinate = diskUv.y * ( uLineCount + 1.0 );
+				void main() {
+					vec4 rayMap = texture2D( uRayMap, vUv );
+					if ( rayMap.a < 0.5 ) {
+						gl_FragColor = vec4( 0.0, 0.0, 0.0, 1.0 );
+						return;
+					}
+					float laneCoordinate = rayMap.y * ( uLineCount + 1.0 );
 					float laneIndex = floor( laneCoordinate + 0.5 );
 					float validLane = step( 0.5, laneIndex ) * step( laneIndex, uLineCount + 0.5 );
 					float radialDistance = abs( laneCoordinate - laneIndex ) / ( uLineCount + 1.0 );
 					float halfWidth = 0.00065 + uLineThickness * 0.009;
-					float antialiasWidth = max( fwidth( diskUv.y ) * 1.25, 0.00035 );
+					float antialiasWidth = max( fwidth( rayMap.y ) * 1.25, 0.00035 );
 					float coreMask = 1.0 - smoothstep( halfWidth - antialiasWidth, halfWidth + antialiasWidth, radialDistance );
 
 					// Every lane has stable random segment lengths, gaps, speed and direction.
@@ -241,7 +205,7 @@
 					float direction = random( laneSeed + 2.0 ) > 0.42 ? 1.0 : -1.0;
 					float speed = mix( 0.55, 1.35, random( laneSeed + 4.0 ) );
 					float timePhase = mod( uTime, PI * 2.0 ) / ( PI * 2.0 );
-					float movingPhi = fract( diskUv.x - direction * timePhase * speed + random( laneSeed + 6.0 ) );
+					float movingPhi = fract( rayMap.x - direction * timePhase * speed + random( laneSeed + 6.0 ) );
 					float segmentCount = floor( mix( 5.0, 12.0, random( laneSeed + 8.0 ) ) );
 					float segmentCoordinate = movingPhi * segmentCount;
 					float cell = floor( segmentCoordinate );
@@ -253,164 +217,16 @@
 					float endFeather = max( fwidth( segmentCoordinate ) * 1.25, 0.012 );
 					float segmentMask = smoothstep( segmentStart - endFeather, segmentStart + endFeather, localPosition ) *
 						( 1.0 - smoothstep( segmentEnd - endFeather, segmentEnd + endFeather, localPosition ) );
-					return coreMask * segmentMask * validLane * validUv;
-				}
-
-				vec3 realismEmission( vec2 diskUv, float imageEnergy ) {
-					if ( diskUv.y < 0.0 || diskUv.y > 1.0 ) return vec3( 0.0 );
-					float filament = filamentMask( diskUv );
-					float heat = pow( clamp( diskUv.y, 0.0, 1.0 ), 0.68 );
-					float phi = diskUv.x * TAU;
-					float approach = sin( uCameraAzimuth - phi );
-					float beta = mix( 0.20, 0.46, heat ) * uRelativisticLighting;
-					float doppler = sqrt( max( 1.0 - beta * beta, 0.01 ) ) / max( 1.0 - beta * approach, 0.2 );
-					float physicalInner = max( uDiskInner, 3.0 );
-					float physicalOuter = max( uDiskInner + uDiskWidth, physicalInner + 0.1 );
-					float radius = mix( physicalOuter, physicalInner, clamp( diskUv.y, 0.0, 1.0 ) );
-					float gravitationalShift = sqrt( max( 1.0 - 1.0 / max( radius, 1.001 ), 0.04 ) );
-					float gain = clamp( doppler * doppler * doppler, 0.28, 3.1 );
-					gain *= mix( 1.0, gravitationalShift, uRelativisticLighting * 0.28 );
-
-					vec3 hotColor = mix( vec3( 1.0, 0.48, 0.18 ), vec3( 0.92, 0.98, 1.0 ), smoothstep( 0.0, 1.0, heat ) );
-					vec3 shiftColor = doppler >= 1.0 ? vec3( 0.68, 0.84, 1.0 ) : vec3( 1.0, 0.34, 0.12 );
-					hotColor = mix( hotColor, shiftColor, min( abs( doppler - 1.0 ) * 0.45, 0.28 ) );
-					vec3 color = mix( vec3( 1.0 ), hotColor, uColorTemperature );
-					return color * filament * gain * imageEnergy;
-				}
-
-				vec2 screenPosition() {
-					vec2 screen = vUv * 2.0 - 1.0;
-					screen.x *= uViewport.x / max( uViewport.y, 1.0 );
-					return screen;
-				}
-
-				float impactParameter( vec2 screen ) {
-					float tangent = length( screen ) * tan( uFieldOfView * 0.5 * PI / 180.0 );
-					float sinTheta = tangent / sqrt( 1.0 + tangent * tangent );
-					return uCameraDistance * sinTheta / sqrt( max( 1.0 - 1.0 / uCameraDistance, 0.01 ) );
-				}
-
-				float criticalRingMask( float impact ) {
-					float width = max( fwidth( impact ) * 1.5, 0.008 );
-					return 1.0 - smoothstep( width, width * 4.0, abs( impact - sqrt( 27.0 / 4.0 ) ) );
-				}
-
-				float rimLayer( float impact, float angle, float cellCount, float seed, float radialOffset ) {
-					float angularCoordinate = fract( angle / TAU + 1.0 ) * cellCount;
-					float cell = floor( angularCoordinate );
-					float localPosition = fract( angularCoordinate );
-					float cellSeed = cell * 23.71 + seed;
-					float variation = random( cellSeed );
-					float segmentStart = mix( 0.04, 0.24, random( cellSeed + 2.0 ) );
-					float segmentEnd = min( 0.97, segmentStart + mix( 0.28, 0.78, random( cellSeed + 4.0 ) ) );
-					float angularFeather = max( fwidth( angularCoordinate ) * 1.25, 0.016 );
-					float segment = smoothstep( segmentStart - angularFeather, segmentStart + angularFeather, localPosition ) *
-						( 1.0 - smoothstep( segmentEnd - angularFeather, segmentEnd + angularFeather, localPosition ) );
-
-					float criticalImpact = sqrt( 27.0 / 4.0 );
-					float ringCenter = criticalImpact + radialOffset + ( variation - 0.5 ) * 0.07;
-					float radialWidth = max( fwidth( impact ) * 0.72, 0.0035 );
-					float radialLine = 1.0 - smoothstep( radialWidth * 0.45, radialWidth * 1.7, abs( impact - ringCenter ) );
-					float visible = step( 0.25, random( cellSeed + 8.0 ) );
-					return segment * radialLine * visible * mix( 0.35, 1.0, variation );
-				}
-
-				vec3 escapingRim( vec2 screen, float impact ) {
-					float angle = atan( screen.y, screen.x );
-					float arcs = rimLayer( impact, angle, 13.0, 13.0, 0.018 ) +
-						rimLayer( impact, angle, 23.0, 71.0, 0.082 ) * 0.58 +
-						rimLayer( impact, angle, 17.0, 37.0, -0.045 ) * 0.5;
-					vec3 spectralRim = mix( vec3( 1.0, 0.72, 0.5 ), vec3( 0.76, 0.88, 1.0 ), uColorTemperature );
-					vec3 rimColor = mix( vec3( 1.0 ), spectralRim, uColorTemperature * 0.45 );
-					return rimColor * arcs * uBrightness * uPhotonRing * 0.095;
-				}
-
-				float starLayer( vec2 screen, float impact, float scale, float seed ) {
-					float screenRadius = max( length( screen ), 1e-5 );
-					vec2 radialDirection = screen / screenRadius;
-					vec2 tangentDirection = vec2( -radialDirection.y, radialDirection.x );
-					float criticalImpact = sqrt( 27.0 / 4.0 );
-					float lensZone = 1.0 - smoothstep( 0.12, 3.2, abs( impact - criticalImpact ) );
-					float lensOffset = uStarLensing * ( 0.016 / ( screenRadius + 0.16 ) + lensZone * 0.052 );
-					vec2 sourcePosition = screen + radialDirection * lensOffset + uStarViewOffset;
-					vec2 gridPosition = sourcePosition * scale;
-					vec2 cell = floor( gridPosition );
-					vec2 localPosition = fract( gridPosition ) - 0.5;
-					float existence = random2( cell + vec2( seed, seed * 0.37 ) );
-					float densityThreshold = mix( 0.997, 0.982, clamp( uStarField / 1.5, 0.0, 1.0 ) );
-					float visible = step( densityThreshold, existence );
-					vec2 starPosition = vec2(
-						random2( cell + vec2( seed + 4.0, seed + 9.0 ) ),
-						random2( cell + vec2( seed + 17.0, seed + 3.0 ) )
-					) - 0.5;
-					vec2 delta = localPosition - starPosition * 0.72;
-					float radialDelta = dot( delta, radialDirection );
-					float tangentialStretch = 1.0 + lensZone * uStarLensing * 7.5;
-					float tangentialDelta = dot( delta, tangentDirection ) / tangentialStretch;
-					float distanceToStar = length( vec2( radialDelta, tangentialDelta ) );
-					float size = mix( 0.022, 0.058, random2( cell + vec2( seed + 31.0 ) ) );
-					float antialias = max( fwidth( distanceToStar ) * 1.35, 0.004 );
-					float shape = 1.0 - smoothstep( size, size + antialias, distanceToStar );
-					float brightness = mix( 0.12, 0.72, random2( cell + vec2( seed + 53.0 ) ) );
-					return visible * shape * brightness;
-				}
-
-				vec3 lensedStars( vec2 screen, float impact ) {
-					if ( uStarField <= 0.0 ) return vec3( 0.0 );
-					float criticalImpact = sqrt( 27.0 / 4.0 );
-					float outsideShadow = smoothstep( criticalImpact - 0.01, criticalImpact + 0.08, impact );
-					float coolLayer = starLayer( screen, impact, 29.0, 11.0 );
-					float warmLayer = starLayer( screen, impact, 47.0, 83.0 );
-					vec3 stars = vec3( 0.62, 0.78, 1.0 ) * coolLayer + vec3( 1.0, 0.78, 0.52 ) * warmLayer * 0.76;
-					return stars * outsideShadow * uStarField;
-				}
-
-				void main() {
-					vec4 rayMap = texture2D( uRayMap, vUv );
+					// Keep the source in linear HDR. Values above 1.0 create the hot,
+					// sharply resolved core that UnrealBloomPass spreads across its mips.
+					// The disk has many overlapping emitters, unlike the sparse reference
+					// model. Normalize their energy before bloom so the five mip levels do
+					// not merge into a flat white veil.
 					float emitterEnergy = uBrightness * 0.18;
-					if ( uRealism < 0.5 ) {
-						float intensity = filamentMask( rayMap.xy ) * emitterEnergy * rayMap.z * step( 0.5, rayMap.a );
-						gl_FragColor = vec4( vec3( max( intensity, 0.0 ) ), 1.0 );
-						return;
-					}
-
-					vec2 screen = screenPosition();
-					float impact = impactParameter( screen );
-					float criticalImpact = sqrt( 27.0 / 4.0 );
-					float shadowFeather = max( fwidth( impact ) * 2.0, 0.012 );
-					float captureBoundary = smoothstep( criticalImpact - shadowFeather, criticalImpact + shadowFeather * 2.0, impact );
-					float primaryVisibility = mix( 1.0, captureBoundary, uShadowDepth );
-					// The direct disk is occluded by the capture shadow. The secondary
-					// lensed image remains partially visible in front, so curved segmented
-					// filaments cross the ball without restoring a straight equatorial cut.
-					float secondaryVisibility = mix( 1.0, mix( 0.58, 1.0, captureBoundary ), uShadowDepth );
-
-					vec3 primary = realismEmission( rayMap.xy, emitterEnergy * 1.12 ) * primaryVisibility;
-					vec3 secondary = vec3( 0.0 );
-					if ( uSecondaryImage > 0.0 && rayMap.w >= 0.0 && rayMap.w <= 1.0 ) {
-						float ringBoost = 1.0 + criticalRingMask( impact ) * uPhotonRing * 1.8;
-						secondary = realismEmission( rayMap.zw, emitterEnergy * uSecondaryImage * 0.72 * ringBoost ) * secondaryVisibility;
-					}
-					vec3 rim = escapingRim( screen, impact );
-					vec3 stars = lensedStars( screen, impact );
-					gl_FragColor = vec4( max( stars + primary + secondary + rim, vec3( 0.0 ) ), 1.0 );
+					float intensity = max( 0.0, coreMask * segmentMask * validLane * emitterEnergy * rayMap.z );
+					gl_FragColor = vec4( vec3( intensity ), 1.0 );
 				}
 			`;
-
-			function syncRelativisticUniforms( position ) {
-				if ( displayMaterial ) {
-					displayMaterial.uniforms.uCameraDistance.value = position.length();
-					displayMaterial.uniforms.uCameraAzimuth.value = Math.atan2( position.x, position.z );
-					displayMaterial.uniforms.uFieldOfView.value = params.fieldOfView;
-					displayMaterial.uniforms.uDiskInner.value = params.diskInner;
-					displayMaterial.uniforms.uDiskWidth.value = params.diskWidth;
-					const inverseDistance = 1 / Math.max( position.length(), 0.0001 );
-					displayMaterial.uniforms.uStarViewOffset.value.set(
-						position.x * inverseDistance * 0.28,
-						position.y * inverseDistance * 0.28
-					);
-				}
-			}
 
 			function updateCameraUniforms() {
 				const distance = params.cameraDistance;
@@ -440,7 +256,6 @@
 				mappingMaterial.uniforms.uFieldOfView.value = params.fieldOfView;
 				mappingMaterial.uniforms.uDiskInner.value = params.diskInner;
 				mappingMaterial.uniforms.uDiskWidth.value = params.diskWidth;
-				syncRelativisticUniforms( position );
 			}
 
 			function applyOrbitCameraToUniforms() {
@@ -454,42 +269,6 @@
 				mappingMaterial.uniforms.uFieldOfView.value = params.fieldOfView;
 				mappingMaterial.uniforms.uDiskInner.value = params.diskInner;
 				mappingMaterial.uniforms.uDiskWidth.value = params.diskWidth;
-				syncRelativisticUniforms( position );
-			}
-
-			function updateRealismStatus( message ) {
-				if ( realismStatus ) realismStatus.textContent = message;
-			}
-
-			function applyRenderMode() {
-				const useRealism = params.renderMode === 'realism' && realismReady;
-				mappingMaterial = useRealism ? realismMappingMaterial : legacyMappingMaterial;
-				if ( mappingQuad ) mappingQuad.material = mappingMaterial;
-				if ( displayMaterial ) displayMaterial.uniforms.uRealism.value = useRealism ? 1 : 0;
-				updateRealismStatus( useRealism ? 'realism LUT active' :
-					params.renderMode === 'realism' ? 'loading realism LUT…' : 'legacy marcher active' );
-				updateCameraUniforms();
-				cancelFullQualityRefinement();
-				if ( previewMappingTarget ) mappingTarget = previewMappingTarget;
-				if ( renderer && mappingTarget ) rebuildRayMap();
-				restoreFullQualitySoon();
-			}
-
-			async function loadRealismRenderer() {
-				updateRealismStatus( 'loading realism LUT…' );
-				try {
-					const textures = await loadRealismLensingTextures();
-					realismMappingMaterial = createRealismLensingMaterial( legacyMappingMaterial.uniforms, textures );
-					realismReady = true;
-					applyRenderMode();
-					renderModeController?.updateDisplay();
-				} catch ( error ) {
-					console.error( error );
-					params.renderMode = 'legacy';
-					localStorage.setItem( STORAGE_KEY, JSON.stringify( params ) );
-					updateRealismStatus( 'realism LUT unavailable · legacy active' );
-					renderModeController?.updateDisplay();
-				}
 			}
 
 			function saveCameraViewSoon() {
@@ -561,8 +340,7 @@
 				const version = fullQualityVersion;
 				const target = fullMappingTarget;
 				const pixelCount = target.width * target.height;
-				const tileCount = params.renderMode === 'realism' && realismReady ? 1 :
-					THREE.MathUtils.clamp( Math.ceil( pixelCount / 450000 ), 2, 12 );
+				const tileCount = THREE.MathUtils.clamp( Math.ceil( pixelCount / 450000 ), 2, 12 );
 				let tileIndex = 0;
 
 				mappingMaterial.uniforms.uResolution.value.set( target.width, target.height );
@@ -629,15 +407,12 @@
 
 			function init() {
 				const container = document.getElementById( 'container' );
-				realismStatus = document.createElement( 'span' );
-				realismStatus.className = 'realism-status';
-				document.getElementById( 'info' ).append( document.createElement( 'br' ), realismStatus );
 				scene = new THREE.Scene();
 				scene.background = new THREE.Color( 0x000000 );
 				mappingScene = new THREE.Scene();
 				camera = new THREE.OrthographicCamera( -1, 1, 1, -1, 0, 1 );
 
-				legacyMappingMaterial = new THREE.ShaderMaterial( {
+				mappingMaterial = new THREE.ShaderMaterial( {
 					vertexShader,
 					fragmentShader: mappingFragmentShader,
 					depthTest: false,
@@ -653,9 +428,7 @@
 						uDiskWidth: { value: params.diskWidth }
 					}
 				} );
-				mappingMaterial = legacyMappingMaterial;
-				mappingQuad = new THREE.Mesh( new THREE.PlaneGeometry( 2, 2 ), mappingMaterial );
-				mappingScene.add( mappingQuad );
+				mappingScene.add( new THREE.Mesh( new THREE.PlaneGeometry( 2, 2 ), mappingMaterial ) );
 				displayMaterial = new THREE.ShaderMaterial( {
 					vertexShader,
 					fragmentShader: displayFragmentShader,
@@ -666,22 +439,7 @@
 						uBrightness: { value: params.lineBrightness },
 						uLineCount: { value: Math.round( params.lineCount ) },
 						uLineThickness: { value: params.lineThickness },
-						uRealism: { value: 0 },
-						uSecondaryImage: { value: params.secondaryImage },
-						uPhotonRing: { value: params.photonRing },
-						uRelativisticLighting: { value: params.relativisticLighting },
-						uColorTemperature: { value: params.colorTemperature },
-						uStarField: { value: params.starField },
-						uStarLensing: { value: params.starLensing },
-						uShadowDepth: { value: params.shadowDepth },
-						uStarViewOffset: { value: new THREE.Vector2() },
-						uCameraDistance: { value: params.cameraDistance },
-						uCameraAzimuth: { value: 0 },
-						uFieldOfView: { value: params.fieldOfView },
-						uDiskInner: { value: params.diskInner },
-						uDiskWidth: { value: params.diskWidth },
-						uViewport: { value: new THREE.Vector2( innerWidth, innerHeight ) },
-						uRayMap: { value: null }
+						uRayMap: { value: null },
 					}
 				} );
 				scene.add( new THREE.Mesh( new THREE.PlaneGeometry( 2, 2 ), displayMaterial ) );
@@ -730,33 +488,6 @@
 				container.appendChild( stats.dom );
 
 				const gui = new GUI();
-				const realismFolder = gui.addFolder( 'realism renderer' );
-				renderModeController = realismFolder.add( params, 'renderMode', {
-					'realism · lookup tables': 'realism',
-					'legacy · ray marcher': 'legacy'
-				} ).name( 'renderer' ).onChange( () => saveAndApply( applyRenderMode ) );
-				addControl( realismFolder, 'secondaryImage', 'secondary image', 0, 1.5, 0.01, () => {
-					displayMaterial.uniforms.uSecondaryImage.value = params.secondaryImage;
-				} );
-				addControl( realismFolder, 'photonRing', 'photon ring', 0, 2, 0.01, () => {
-					displayMaterial.uniforms.uPhotonRing.value = params.photonRing;
-				} );
-				addControl( realismFolder, 'relativisticLighting', 'relativistic light', 0, 1, 0.01, () => {
-					displayMaterial.uniforms.uRelativisticLighting.value = params.relativisticLighting;
-				} );
-				addControl( realismFolder, 'colorTemperature', 'temperature color', 0, 1, 0.01, () => {
-					displayMaterial.uniforms.uColorTemperature.value = params.colorTemperature;
-				} );
-				addControl( realismFolder, 'shadowDepth', 'shadow depth', 0, 1, 0.01, () => {
-					displayMaterial.uniforms.uShadowDepth.value = params.shadowDepth;
-				} );
-				addControl( realismFolder, 'starField', 'lensed stars', 0, 1.5, 0.01, () => {
-					displayMaterial.uniforms.uStarField.value = params.starField;
-				} );
-				addControl( realismFolder, 'starLensing', 'star deformation', 0, 1.5, 0.01, () => {
-					displayMaterial.uniforms.uStarLensing.value = params.starLensing;
-				} );
-
 				const pathFolder = gui.addFolder( 'simulation path' );
 				addControl( pathFolder, 'lineCount', 'line count', 1, 30, 1, updateLineStyle );
 				addControl( pathFolder, 'lineThickness', 'line thickness', 0.01, 0.5, 0.01, updateLineStyle );
@@ -788,15 +519,7 @@
 						localStorage.removeItem( STORAGE_KEY );
 						gui.controllersRecursive().forEach( ( controller ) => controller.updateDisplay() );
 						updateLineStyle();
-						displayMaterial.uniforms.uSecondaryImage.value = params.secondaryImage;
-						displayMaterial.uniforms.uPhotonRing.value = params.photonRing;
-						displayMaterial.uniforms.uRelativisticLighting.value = params.relativisticLighting;
-						displayMaterial.uniforms.uColorTemperature.value = params.colorTemperature;
-						displayMaterial.uniforms.uStarField.value = params.starField;
-						displayMaterial.uniforms.uStarLensing.value = params.starLensing;
-						displayMaterial.uniforms.uShadowDepth.value = params.shadowDepth;
 						updateCameraUniforms();
-						applyRenderMode();
 						displayMaterial.uniforms.uBrightness.value = params.lineBrightness;
 						bloomPass.threshold = params.threshold;
 						bloomPass.strength = params.strength;
@@ -811,7 +534,6 @@
 				document.addEventListener( 'visibilitychange', onVisibilityChange );
 				onWindowResize();
 				renderer.setAnimationLoop( animate );
-				loadRealismRenderer();
 			}
 
 			function createMappingTarget( width, height ) {
@@ -834,7 +556,6 @@
 				renderer.setSize( innerWidth, innerHeight );
 				composer.setPixelRatio( pixelRatio );
 				composer.setSize( innerWidth, innerHeight );
-				displayMaterial.uniforms.uViewport.value.set( innerWidth, innerHeight );
 				orbitCamera.aspect = innerWidth / innerHeight;
 				orbitCamera.updateProjectionMatrix();
 				const size = renderer.getDrawingBufferSize( new THREE.Vector2() );

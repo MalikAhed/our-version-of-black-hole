@@ -37,12 +37,6 @@ button {
 	z-index: 1; /* TODO Solve this in HTML */
 }
 
-.realism-status {
-	color: #87d7ff;
-	font-size: 11px;
-	letter-spacing: 0.04em;
-}
-
 a, button, input, select {
 	pointer-events: auto;
 }
