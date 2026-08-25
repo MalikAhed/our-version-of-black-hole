@@ -24,32 +24,38 @@
 
 			const STORAGE_KEY = 'schwarzschild-line-study-v1';
 			const defaults = Object.freeze( {
-				styleVersion: 7,
-				// Match the official Unreal Bloom example's visible defaults.
-				threshold: 0, strength: 1, radius: 0.5, exposure: 1,
-				lineCount: 22, lineThickness: 0.03, lineBrightness: 2.6,
-				diskInner: 2, diskWidth: 4, cameraDistance: 10.69,
-				inclination: 13.24, movementAngle: 12, fieldOfView: 68,
-				orbitSpeed: 0.96, resolutionScale: 1
+				styleVersion: 8,
+				threshold: 0, strength: 1.43, radius: 0, exposure: 0.94,
+				lineCount: 30, lineThickness: 0.01, lineBrightness: 2.6,
+				diskInner: 2.11, diskWidth: 3.76, cameraDistance: 10.69,
+				inclination: 16.1413, movementAngle: 75.3603, fieldOfView: 68,
+				orbitSpeed: 0.68, resolutionScale: 1
+			} );
+			// Sliders keep a compact, device-friendly editing range. The input fields
+			// accept this broader range so precise values can also be entered below or
+			// above a slider, while hard limits reject invalid or hazardous values.
+			const inputLimits = Object.freeze( {
+				lineCount: [ 1, 200 ], lineThickness: [ 0.001, 2 ],
+				diskInner: [ 1.01, 20 ], diskWidth: [ 0.05, 20 ],
+				orbitSpeed: [ -10, 10 ], cameraDistance: [ 2, 60 ],
+				inclination: [ 0.01, 179.99 ], movementAngle: [ -3600, 3600 ],
+				fieldOfView: [ 5, 150 ], lineBrightness: [ 0, 20 ],
+				threshold: [ 0, 10 ], strength: [ 0, 10 ], radius: [ 0, 2 ],
+				exposure: [ 0.01, 4 ],
+				// Supersampling above 1 can allocate very large GPU buffers. Typed input
+				// may lower quality further, but cannot exceed native device resolution.
+				resolutionScale: [ 0.25, 1 ]
 			} );
 			const saved = JSON.parse( localStorage.getItem( STORAGE_KEY ) || '{}' );
 			const params = { ...defaults, ...saved };
 			if ( params.styleVersion !== defaults.styleVersion ) {
-				Object.assign( params, {
-					styleVersion: defaults.styleVersion,
-					threshold: defaults.threshold,
-					strength: defaults.strength,
-					radius: defaults.radius,
-					exposure: defaults.exposure,
-					lineCount: defaults.lineCount,
-					lineThickness: defaults.lineThickness,
-					lineBrightness: defaults.lineBrightness,
-					resolutionScale: defaults.resolutionScale
-				} );
+				Object.assign( params, defaults );
 				localStorage.setItem( STORAGE_KEY, JSON.stringify( params ) );
 			}
-			// Older saved sessions used a much heavier scale that predates ray marching.
-			if ( Number( saved.resolutionScale ) > 0.7 ) params.resolutionScale = defaults.resolutionScale;
+			for ( const [ key, [ min, max ] ] of Object.entries( inputLimits ) ) {
+				const value = Number( params[ key ] );
+				params[ key ] = Number.isFinite( value ) ? THREE.MathUtils.clamp( value, min, max ) : defaults[ key ];
+			}
 			const TAU = Math.PI * 2;
 
 			let renderer, composer, bloomPass, scene, mappingScene, camera, orbitCamera, orbitControls, stats;
@@ -402,7 +408,14 @@
 			}
 
 			function addControl( folder, key, label, min, max, step, action = updateSimulation ) {
-				return folder.add( params, key, min, max, step ).name( label ).onChange( () => saveAndApply( action ) );
+				const controller = folder.add( params, key, min, max, step ).name( label );
+				const [ inputMin, inputMax ] = inputLimits[ key ] || [ min, max ];
+				// Slider pointer positions still map to min/max; typed and keyboard values
+				// can reach the broader validated limits.
+				controller._clamp = ( value ) => THREE.MathUtils.clamp( value, inputMin, inputMax );
+				controller.$input.min = inputMin;
+				controller.$input.max = inputMax;
+				return controller.onChange( () => saveAndApply( action ) );
 			}
 
 			function init() {
