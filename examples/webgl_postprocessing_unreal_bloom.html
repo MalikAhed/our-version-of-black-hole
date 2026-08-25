@@ -16,16 +16,20 @@
 			import * as THREE from 'three';
 			import Stats from 'three/addons/libs/stats.module.js';
 			import { GUI } from 'three/addons/libs/lil-gui.module.min.js';
+			import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+			import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+			import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+			import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
 
 			const STORAGE_KEY = 'schwarzschild-line-study-v1';
 			const defaults = Object.freeze( {
-				styleVersion: 6,
+				styleVersion: 7,
 				// Match the official Unreal Bloom example's visible defaults.
 				threshold: 0, strength: 1, radius: 0.5, exposure: 1,
 				lineCount: 22, lineThickness: 0.03, lineBrightness: 2.6,
 				diskInner: 2, diskWidth: 4, cameraDistance: 10.69,
 				inclination: 13.24, movementAngle: 12, fieldOfView: 68,
-				orbitSpeed: 0.96, resolutionScale: 0.45
+				orbitSpeed: 0.96, resolutionScale: 1
 			} );
 			const saved = JSON.parse( localStorage.getItem( STORAGE_KEY ) || '{}' );
 			const params = { ...defaults, ...saved };
@@ -47,9 +51,9 @@
 			if ( Number( saved.resolutionScale ) > 0.7 ) params.resolutionScale = defaults.resolutionScale;
 			const TAU = Math.PI * 2;
 
-			let renderer, scene, mappingScene, blurScene, compositeScene, camera, stats;
-			let mappingMaterial, displayMaterial, blurMaterial, compositeMaterial;
-			let mappingTarget, lineTarget, glowTargetA, glowTargetB, rayMapFrame;
+			let renderer, composer, bloomPass, scene, mappingScene, camera, stats;
+			let mappingMaterial, displayMaterial;
+			let mappingTarget, rayMapFrame;
 			let previousTime = performance.now();
 
 			const vertexShader = /* glsl */`
@@ -156,8 +160,6 @@
 				varying vec2 vUv;
 				uniform float uTime;
 				uniform float uBrightness;
-				uniform float uThreshold;
-				uniform float uExposure;
 				uniform float uLineCount;
 				uniform float uLineThickness;
 				uniform sampler2D uRayMap;
@@ -198,40 +200,14 @@
 					float endFeather = max( fwidth( segmentCoordinate ) * 1.25, 0.012 );
 					float segmentMask = smoothstep( segmentStart - endFeather, segmentStart + endFeather, localPosition ) *
 						( 1.0 - smoothstep( segmentEnd - endFeather, segmentEnd + endFeather, localPosition ) );
-					float core = smoothstep( uThreshold, 1.0, coreMask * segmentMask ) * validLane * uBrightness;
-					float intensity = core * rayMap.z * uExposure;
-					float monochrome = 1.0 - exp( -intensity );
-					gl_FragColor = vec4( vec3( monochrome ), 1.0 );
-				}
-			`;
-
-			// A true Gaussian bloom, evaluated on half-resolution buffers. The same
-			// five-tap shader is applied horizontally and vertically.
-			const blurFragmentShader = /* glsl */`
-				varying vec2 vUv;
-				uniform sampler2D uInput;
-				uniform vec2 uDirection;
-
-				void main() {
-					vec3 color = texture2D( uInput, vUv ).rgb * 0.227027;
-					color += texture2D( uInput, vUv + uDirection * 1.384615 ).rgb * 0.316216;
-					color += texture2D( uInput, vUv - uDirection * 1.384615 ).rgb * 0.316216;
-					color += texture2D( uInput, vUv + uDirection * 3.230769 ).rgb * 0.070270;
-					color += texture2D( uInput, vUv - uDirection * 3.230769 ).rgb * 0.070270;
-					gl_FragColor = vec4( color, 1.0 );
-				}
-			`;
-
-			const compositeFragmentShader = /* glsl */`
-				varying vec2 vUv;
-				uniform sampler2D uLines;
-				uniform sampler2D uGlow;
-				uniform float uGlowStrength;
-
-				void main() {
-					vec3 core = texture2D( uLines, vUv ).rgb;
-					vec3 bloom = texture2D( uGlow, vUv ).rgb;
-					gl_FragColor = vec4( min( vec3( 1.0 ), core + bloom * uGlowStrength * 2.5 ), 1.0 );
+					// Keep the source in linear HDR. Values above 1.0 create the hot,
+					// sharply resolved core that UnrealBloomPass spreads across its mips.
+					// The disk has many overlapping emitters, unlike the sparse reference
+					// model. Normalize their energy before bloom so the five mip levels do
+					// not merge into a flat white veil.
+					float emitterEnergy = uBrightness * 0.18;
+					float intensity = max( 0.0, coreMask * segmentMask * validLane * emitterEnergy * rayMap.z );
+					gl_FragColor = vec4( vec3( intensity ), 1.0 );
 				}
 			`;
 
@@ -293,8 +269,6 @@
 				scene = new THREE.Scene();
 				scene.background = new THREE.Color( 0x000000 );
 				mappingScene = new THREE.Scene();
-				blurScene = new THREE.Scene();
-				compositeScene = new THREE.Scene();
 				camera = new THREE.OrthographicCamera( -1, 1, 1, -1, 0, 1 );
 
 				mappingMaterial = new THREE.ShaderMaterial( {
@@ -322,43 +296,32 @@
 					uniforms: {
 						uTime: { value: 0 },
 						uBrightness: { value: params.lineBrightness },
-						uThreshold: { value: params.threshold },
-						uExposure: { value: params.exposure },
 						uLineCount: { value: Math.round( params.lineCount ) },
 						uLineThickness: { value: params.lineThickness },
 						uRayMap: { value: null },
 					}
 				} );
 				scene.add( new THREE.Mesh( new THREE.PlaneGeometry( 2, 2 ), displayMaterial ) );
-				blurMaterial = new THREE.ShaderMaterial( {
-					vertexShader,
-					fragmentShader: blurFragmentShader,
-					depthTest: false,
-					depthWrite: false,
-					uniforms: {
-						uInput: { value: null },
-						uDirection: { value: new THREE.Vector2() }
-					}
-				} );
-				blurScene.add( new THREE.Mesh( new THREE.PlaneGeometry( 2, 2 ), blurMaterial ) );
-				compositeMaterial = new THREE.ShaderMaterial( {
-					vertexShader,
-					fragmentShader: compositeFragmentShader,
-					depthTest: false,
-					depthWrite: false,
-					uniforms: {
-						uLines: { value: null },
-						uGlow: { value: null },
-						uGlowStrength: { value: params.strength }
-					}
-				} );
-				compositeScene.add( new THREE.Mesh( new THREE.PlaneGeometry( 2, 2 ), compositeMaterial ) );
 				updateCameraUniforms();
 
-				renderer = new THREE.WebGLRenderer( { antialias: false, powerPreference: 'high-performance' } );
-				renderer.setPixelRatio( Math.min( devicePixelRatio, params.resolutionScale ) );
+				renderer = new THREE.WebGLRenderer( { antialias: true, powerPreference: 'high-performance' } );
+				renderer.setPixelRatio( Math.min( devicePixelRatio, 2 ) * params.resolutionScale );
 				renderer.setSize( innerWidth, innerHeight );
+				renderer.toneMapping = THREE.ACESFilmicToneMapping;
+				renderer.toneMappingExposure = Math.pow( params.exposure, 4.0 );
 				container.appendChild( renderer.domElement );
+
+				const renderPass = new RenderPass( scene, camera );
+				bloomPass = new UnrealBloomPass(
+					new THREE.Vector2( innerWidth, innerHeight ),
+					params.strength,
+					params.radius,
+					params.threshold
+				);
+				composer = new EffectComposer( renderer );
+				composer.addPass( renderPass );
+				composer.addPass( bloomPass );
+				composer.addPass( new OutputPass() );
 
 				stats = new Stats();
 				container.appendChild( stats.dom );
@@ -379,13 +342,13 @@
 				addControl( viewFolder, 'lineBrightness', 'brightness', 0.1, 6, 0.01, () => displayMaterial.uniforms.uBrightness.value = params.lineBrightness );
 
 				const bloomFolder = gui.addFolder( 'bloom' );
-				addControl( bloomFolder, 'threshold', 'threshold', 0, 1, 0.01, () => displayMaterial.uniforms.uThreshold.value = params.threshold );
-				addControl( bloomFolder, 'strength', 'strength', 0, 3, 0.01, () => compositeMaterial.uniforms.uGlowStrength.value = params.strength );
-				addControl( bloomFolder, 'radius', 'radius', 0, 1, 0.01, () => {} );
-				addControl( bloomFolder, 'exposure', 'exposure', 0.1, 2, 0.01, () => displayMaterial.uniforms.uExposure.value = params.exposure );
+				addControl( bloomFolder, 'threshold', 'threshold', 0, 1, 0.01, () => bloomPass.threshold = params.threshold );
+				addControl( bloomFolder, 'strength', 'strength', 0, 3, 0.01, () => bloomPass.strength = params.strength );
+				addControl( bloomFolder, 'radius', 'radius', 0, 1, 0.01, () => bloomPass.radius = params.radius );
+				addControl( bloomFolder, 'exposure', 'exposure', 0.1, 2, 0.01, () => renderer.toneMappingExposure = Math.pow( params.exposure, 4.0 ) );
 
 				const performanceFolder = gui.addFolder( 'performance' );
-				addControl( performanceFolder, 'resolutionScale', 'render scale', 0.3, 0.7, 0.01, onWindowResize );
+				addControl( performanceFolder, 'resolutionScale', 'render scale', 0.5, 1, 0.05, onWindowResize );
 
 				const actions = {
 					reset() {
@@ -395,9 +358,10 @@
 						updateLineStyle();
 						updateCameraUniforms();
 						displayMaterial.uniforms.uBrightness.value = params.lineBrightness;
-						displayMaterial.uniforms.uThreshold.value = params.threshold;
-						compositeMaterial.uniforms.uGlowStrength.value = params.strength;
-						displayMaterial.uniforms.uExposure.value = params.exposure;
+						bloomPass.threshold = params.threshold;
+						bloomPass.strength = params.strength;
+						bloomPass.radius = params.radius;
+						renderer.toneMappingExposure = Math.pow( params.exposure, 4.0 );
 						onWindowResize();
 					}
 				};
@@ -409,8 +373,11 @@
 			}
 
 			function onWindowResize() {
-				renderer.setPixelRatio( Math.min( devicePixelRatio, params.resolutionScale ) );
+				const pixelRatio = Math.min( devicePixelRatio, 2 ) * params.resolutionScale;
+				renderer.setPixelRatio( pixelRatio );
 				renderer.setSize( innerWidth, innerHeight );
+				composer.setPixelRatio( pixelRatio );
+				composer.setSize( innerWidth, innerHeight );
 				const size = renderer.getDrawingBufferSize( new THREE.Vector2() );
 				mappingMaterial.uniforms.uResolution.value.copy( size );
 				mappingTarget?.dispose();
@@ -422,29 +389,7 @@
 					depthBuffer: false,
 					stencilBuffer: false
 				} );
-				lineTarget?.dispose();
-				lineTarget = new THREE.WebGLRenderTarget( size.x, size.y, {
-					format: THREE.RGBAFormat,
-					minFilter: THREE.LinearFilter,
-					magFilter: THREE.LinearFilter,
-					depthBuffer: false,
-					stencilBuffer: false
-				} );
-				const glowWidth = Math.max( 1, Math.floor( size.x * 0.5 ) );
-				const glowHeight = Math.max( 1, Math.floor( size.y * 0.5 ) );
-				glowTargetA?.dispose();
-				glowTargetB?.dispose();
-				glowTargetA = new THREE.WebGLRenderTarget( glowWidth, glowHeight, {
-					format: THREE.RGBAFormat,
-					minFilter: THREE.LinearFilter,
-					magFilter: THREE.LinearFilter,
-					depthBuffer: false,
-					stencilBuffer: false
-				} );
-				glowTargetB = glowTargetA.clone();
 				displayMaterial.uniforms.uRayMap.value = mappingTarget.texture;
-				compositeMaterial.uniforms.uLines.value = lineTarget.texture;
-				compositeMaterial.uniforms.uGlow.value = glowTargetB.texture;
 				rebuildRayMap();
 			}
 
@@ -453,22 +398,7 @@
 				previousTime = now;
 				displayMaterial.uniforms.uTime.value = ( displayMaterial.uniforms.uTime.value + delta * params.orbitSpeed ) % TAU;
 				stats.update();
-				renderer.setRenderTarget( lineTarget );
-				renderer.render( scene, camera );
-
-				const blurSpread = THREE.MathUtils.lerp( 2.5, 8, params.radius );
-				blurMaterial.uniforms.uInput.value = lineTarget.texture;
-				blurMaterial.uniforms.uDirection.value.set( blurSpread / lineTarget.width, 0 );
-				renderer.setRenderTarget( glowTargetA );
-				renderer.render( blurScene, camera );
-
-				blurMaterial.uniforms.uInput.value = glowTargetA.texture;
-				blurMaterial.uniforms.uDirection.value.set( 0, blurSpread * 0.5 / glowTargetA.height );
-				renderer.setRenderTarget( glowTargetB );
-				renderer.render( blurScene, camera );
-
-				renderer.setRenderTarget( null );
-				renderer.render( compositeScene, camera );
+				composer.render( delta );
 			}
 
 			init();
