@@ -29,7 +29,7 @@
 				lineCount: 30, lineThickness: 0.01, lineBrightness: 2.6,
 				diskInner: 2.11, diskWidth: 3.76, cameraDistance: 10.69,
 				inclination: 16.1413, movementAngle: 75.3603, fieldOfView: 68,
-				orbitSpeed: 0.68, resolutionScale: 1
+				orbitSpeed: 0.68, resolutionScale: 1, invertColors: false
 			} );
 			// Sliders keep a compact, device-friendly editing range. The input fields
 			// accept this broader range so precise values can also be entered below or
@@ -407,6 +407,10 @@
 				action();
 			}
 
+			function updateColorMode() {
+				renderer.domElement.style.filter = params.invertColors ? 'invert(1)' : 'none';
+			}
+
 			function addControl( folder, key, label, min, max, step, action = updateSimulation ) {
 				const controller = folder.add( params, key, min, max, step ).name( label );
 				const [ inputMin, inputMax ] = inputLimits[ key ] || [ min, max ];
@@ -463,6 +467,7 @@
 				renderer.setSize( innerWidth, innerHeight );
 				renderer.toneMapping = THREE.ACESFilmicToneMapping;
 				renderer.toneMappingExposure = Math.pow( params.exposure, 4.0 );
+				updateColorMode();
 				renderer.domElement.style.cursor = 'grab';
 				container.appendChild( renderer.domElement );
 
@@ -516,6 +521,7 @@
 				];
 				addControl( viewFolder, 'fieldOfView', 'field of view', 25, 110, 0.1 );
 				addControl( viewFolder, 'lineBrightness', 'brightness', 0.1, 6, 0.01, () => displayMaterial.uniforms.uBrightness.value = params.lineBrightness );
+				viewFolder.add( params, 'invertColors' ).name( 'invert colors' ).onChange( () => saveAndApply( updateColorMode ) );
 
 				const bloomFolder = gui.addFolder( 'bloom' );
 				addControl( bloomFolder, 'threshold', 'threshold', 0, 1, 0.01, () => bloomPass.threshold = params.threshold );
@@ -536,9 +542,10 @@
 						displayMaterial.uniforms.uBrightness.value = params.lineBrightness;
 						bloomPass.threshold = params.threshold;
 						bloomPass.strength = params.strength;
-						bloomPass.radius = params.radius;
-						renderer.toneMappingExposure = Math.pow( params.exposure, 4.0 );
-						onWindowResize();
+					bloomPass.radius = params.radius;
+					renderer.toneMappingExposure = Math.pow( params.exposure, 4.0 );
+					updateColorMode();
+					onWindowResize();
 					}
 				};
 				gui.add( actions, 'reset' ).name( 'reset saved values' );
