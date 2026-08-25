@@ -54,7 +54,8 @@
 
 			let renderer, composer, bloomPass, scene, mappingScene, camera, orbitCamera, orbitControls, stats;
 			let mappingMaterial, displayMaterial;
-			let mappingTarget, fullMappingTarget, previewMappingTarget, rayMapFrame, cameraSaveTimer, cameraSettleTimer;
+			let mappingTarget, fullMappingTarget, previewMappingTarget, rayMapFrame, fullQualityFrame;
+			let cameraSaveTimer, cameraSettleTimer, fullQualityVersion = 0;
 			let syncingOrbitCamera = false;
 			let viewControllers = [];
 			let previousTime = performance.now();
@@ -88,9 +89,9 @@
 				uniform float uDiskWidth;
 
 				vec3 lorentzTransformVelocity( vec3 u, vec3 v ) {
-					float speed = length( v );
-					if ( speed > 0.0 ) {
-						float gamma = 1.0 / sqrt( 1.0 - dot( v, v ) );
+					float speedSquared = dot( v, v );
+					if ( speedSquared > 0.0 ) {
+						float gamma = 1.0 / sqrt( 1.0 - speedSquared );
 						float denominator = 1.0 - dot( v, u );
 						return ( u / gamma - v + ( gamma / ( gamma + 1.0 ) ) * dot( u, v ) * v ) / denominator;
 					}
@@ -116,23 +117,29 @@
 					float h2 = dot( angularMomentum, angularMomentum );
 					// Rays this far outside the disk cannot create a visible lensed line.
 					// Rejecting them before the loop keeps empty background pixels cheap.
-					if ( sqrt( h2 ) > uDiskInner + uDiskWidth + 2.5 ) {
+					float angularLimit = uDiskInner + uDiskWidth + 2.5;
+					if ( h2 > angularLimit * angularLimit ) {
 						gl_FragColor = vec4( 0.0 );
 						return;
 					}
 					float rayGamma = 1.0 / sqrt( 1.0 - dot( uCameraVelocity, uCameraVelocity ) );
 					float rayDoppler = rayGamma * ( 1.0 + dot( rayDir, -uCameraVelocity ) );
-					float rayIntensity = 1.0 / pow( rayDoppler, 3.0 );
+					float rayIntensity = 1.0 / ( rayDoppler * rayDoppler * rayDoppler );
+					float escapeRadius = max( length( uCameraPosition ) + 1.0, uDiskInner + uDiskWidth + 1.0 );
+					float escapeRadiusSquared = escapeRadius * escapeRadius;
+					float oldRadiusSquared = dot( point, point );
 					vec3 oldpoint;
 
 					for ( int i = 0; i < NSTEPS; i ++ ) {
 						oldpoint = point;
 						point += velocity * STEP;
-						vec3 accel = -1.5 * h2 * point / pow( dot( point, point ), 2.5 );
+						float radiusSquared = dot( point, point );
+						float inverseRadius = inversesqrt( radiusSquared );
+						float inverseRadiusSquared = 1.0 / radiusSquared;
+						vec3 accel = -1.5 * h2 * point * inverseRadiusSquared * inverseRadiusSquared * inverseRadius;
 						velocity += accel * STEP;
 
-						float distanceFromHole = length( point );
-						if ( distanceFromHole < 1.0 && length( oldpoint ) > 1.0 ) break;
+						if ( radiusSquared < 1.0 && oldRadiusSquared > 1.0 ) break;
 
 						if ( oldpoint.y * point.y < 0.0 ) {
 							float lambda = -oldpoint.y / velocity.y;
@@ -144,6 +151,7 @@
 									sqrt( 2.0 * ( r - 1.0 ) ) / ( r * r );
 								phi = mod( phi + PI * 2.0, PI * 2.0 );
 								float diskGamma = 1.0 / sqrt( 1.0 - dot( diskVelocity, diskVelocity ) );
+								float distanceFromHole = sqrt( radiusSquared );
 								float diskDoppler = diskGamma * ( 1.0 + dot( rayDir / distanceFromHole, diskVelocity ) );
 								vec2 diskUv = vec2( phi / ( 2.0 * PI ), 1.0 - ( r - uDiskInner ) / uDiskWidth );
 								float gain = rayIntensity / ( rayDoppler * diskDoppler );
@@ -151,6 +159,11 @@
 								return;
 							}
 						}
+
+						// Once an unbound ray has passed both the camera and the disk while
+						// travelling outward, it cannot produce a later disk intersection.
+						if ( radiusSquared > escapeRadiusSquared && dot( point, velocity ) > 0.0 ) break;
+						oldRadiusSquared = radiusSquared;
 					}
 
 					gl_FragColor = vec4( 0.0 );
@@ -268,10 +281,21 @@
 			function restoreFullQualitySoon() {
 				clearTimeout( cameraSettleTimer );
 				cameraSettleTimer = setTimeout( () => {
-					if ( ! fullMappingTarget ) return;
-					mappingTarget = fullMappingTarget;
-					scheduleRayMap();
+					startFullQualityRefinement();
 				}, 140 );
+			}
+
+			function cancelFullQualityRefinement() {
+				fullQualityVersion ++;
+				if ( fullQualityFrame ) cancelAnimationFrame( fullQualityFrame );
+				fullQualityFrame = 0;
+			}
+
+			function requestInteractiveRayMap() {
+				cancelFullQualityRefinement();
+				if ( previewMappingTarget ) mappingTarget = previewMappingTarget;
+				scheduleRayMap();
+				restoreFullQualitySoon();
 			}
 
 			function onOrbitChange() {
@@ -283,10 +307,8 @@
 				params.movementAngle = THREE.MathUtils.radToDeg( Math.atan2( -position.x, position.y ) );
 				applyOrbitCameraToUniforms();
 				viewControllers.forEach( ( controller ) => controller.updateDisplay() );
-				if ( previewMappingTarget ) mappingTarget = previewMappingTarget;
-				scheduleRayMap();
+				requestInteractiveRayMap();
 				saveCameraViewSoon();
-				restoreFullQualitySoon();
 			}
 
 			function beginCameraInteraction() {
@@ -310,6 +332,52 @@
 				displayMaterial.uniforms.uRayMap.value = mappingTarget.texture;
 			}
 
+			function startFullQualityRefinement() {
+				if ( ! renderer || ! fullMappingTarget ) return;
+				cancelFullQualityRefinement();
+				if ( rayMapFrame ) cancelAnimationFrame( rayMapFrame );
+				rayMapFrame = 0;
+				const version = fullQualityVersion;
+				const target = fullMappingTarget;
+				const pixelCount = target.width * target.height;
+				const tileCount = THREE.MathUtils.clamp( Math.ceil( pixelCount / 450000 ), 2, 12 );
+				let tileIndex = 0;
+
+				mappingMaterial.uniforms.uResolution.value.set( target.width, target.height );
+				const previousTarget = renderer.getRenderTarget();
+				renderer.setRenderTarget( target );
+				renderer.setScissorTest( false );
+				renderer.clear();
+				renderer.setRenderTarget( previousTarget );
+
+				const renderNextTile = () => {
+					if ( version !== fullQualityVersion ) return;
+					const y = Math.floor( tileIndex * target.height / tileCount );
+					const nextY = Math.floor( ( tileIndex + 1 ) * target.height / tileCount );
+					const oldTarget = renderer.getRenderTarget();
+					const oldScissorTest = renderer.getScissorTest();
+
+					mappingMaterial.uniforms.uResolution.value.set( target.width, target.height );
+					renderer.setRenderTarget( target );
+					renderer.setScissor( 0, y, target.width, nextY - y );
+					renderer.setScissorTest( true );
+					renderer.render( mappingScene, camera );
+					renderer.setScissorTest( oldScissorTest );
+					renderer.setRenderTarget( oldTarget );
+
+					tileIndex ++;
+					if ( tileIndex < tileCount ) {
+						fullQualityFrame = requestAnimationFrame( renderNextTile );
+					} else {
+						fullQualityFrame = 0;
+						mappingTarget = target;
+						displayMaterial.uniforms.uRayMap.value = target.texture;
+					}
+				};
+
+				fullQualityFrame = requestAnimationFrame( renderNextTile );
+			}
+
 			function scheduleRayMap() {
 				if ( rayMapFrame ) return;
 				rayMapFrame = requestAnimationFrame( () => {
@@ -320,7 +388,7 @@
 
 			function updateSimulation() {
 				updateCameraUniforms();
-				scheduleRayMap();
+				requestInteractiveRayMap();
 			}
 
 			function updateLineStyle() {
@@ -391,7 +459,7 @@
 				orbitControls = new OrbitControls( orbitCamera, renderer.domElement );
 				orbitControls.target.set( 0, 0, 0 );
 				orbitControls.enableDamping = true;
-				orbitControls.dampingFactor = 0.09;
+				orbitControls.dampingFactor = 0.18;
 				orbitControls.enablePan = false;
 				orbitControls.rotateSpeed = 0.55;
 				orbitControls.zoomSpeed = 0.75;
@@ -463,6 +531,7 @@
 				gui.add( actions, 'reset' ).name( 'reset saved values' );
 
 				addEventListener( 'resize', onWindowResize );
+				document.addEventListener( 'visibilitychange', onVisibilityChange );
 				onWindowResize();
 				renderer.setAnimationLoop( animate );
 			}
@@ -479,6 +548,9 @@
 			}
 
 			function onWindowResize() {
+				cancelFullQualityRefinement();
+				if ( rayMapFrame ) cancelAnimationFrame( rayMapFrame );
+				rayMapFrame = 0;
 				const pixelRatio = Math.min( devicePixelRatio, 2 ) * params.resolutionScale;
 				renderer.setPixelRatio( pixelRatio );
 				renderer.setSize( innerWidth, innerHeight );
@@ -491,11 +563,21 @@
 				previewMappingTarget?.dispose();
 				fullMappingTarget = createMappingTarget( size.x, size.y );
 				previewMappingTarget = createMappingTarget(
-					Math.max( 1, Math.round( size.x * 0.42 ) ),
-					Math.max( 1, Math.round( size.y * 0.42 ) )
+					Math.max( 1, Math.round( size.x * 0.35 ) ),
+					Math.max( 1, Math.round( size.y * 0.35 ) )
 				);
-				mappingTarget = fullMappingTarget;
+				mappingTarget = previewMappingTarget;
 				rebuildRayMap();
+				restoreFullQualitySoon();
+			}
+
+			function onVisibilityChange() {
+				if ( document.hidden ) {
+					renderer.setAnimationLoop( null );
+				} else {
+					previousTime = performance.now();
+					renderer.setAnimationLoop( animate );
+				}
 			}
 
 			function animate( now ) {

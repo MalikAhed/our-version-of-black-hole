@@ -22,5 +22,9 @@ Use left-drag or one-finger touch to orbit around the black hole. Use the mouse
 wheel, trackpad, or pinch gesture to zoom. The precise editor sliders remain
 synchronized with the direct camera controls.
 
+Camera motion uses a lightweight ray-map preview and then refines the unchanged
+full-resolution result in tiles after movement settles. Rendering also pauses
+when the browser tab is hidden.
+
 The Git tag `pre-official-unreal-bloom` restores the state immediately before
 the official bloom integration.
