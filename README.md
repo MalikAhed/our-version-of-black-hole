@@ -3,6 +3,8 @@
 Standalone Schwarzschild line-path simulation with the custom editor and bloom
 work preserved from the Three.js study.
 
+Live site: <https://malikahed.github.io/our-version-of-black-hole/>
+
 The authored geodesic paths and randomized ray segments are rendered as linear
 HDR emitters, then passed through the official Three.js post-processing chain:
 `RenderPass`, `UnrealBloomPass`, and `OutputPass` with ACES filmic tone mapping.
