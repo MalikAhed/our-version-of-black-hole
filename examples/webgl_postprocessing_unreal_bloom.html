@@ -1,0 +1,477 @@
+<!DOCTYPE html>
+<html lang="en">
+	<head>
+		<title>three.js - Schwarzschild line-path study</title>
+		<meta charset="utf-8">
+		<meta name="viewport" content="width=device-width, user-scalable=no, minimum-scale=1.0, maximum-scale=1.0">
+		<link type="text/css" rel="stylesheet" href="main.css">
+	</head>
+	<body>
+		<div id="container"></div>
+		<div id="info"><a href="https://threejs.org" target="_blank" rel="noopener">three.js</a> - Schwarzschild-lensed line paths</div>
+		<script type="importmap">
+			{ "imports": { "three": "../build/three.module.js", "three/addons/": "./jsm/" } }
+		</script>
+		<script type="module">
+			import * as THREE from 'three';
+			import Stats from 'three/addons/libs/stats.module.js';
+			import { GUI } from 'three/addons/libs/lil-gui.module.min.js';
+
+			const STORAGE_KEY = 'schwarzschild-line-study-v1';
+			const defaults = Object.freeze( {
+				styleVersion: 6,
+				// Match the official Unreal Bloom example's visible defaults.
+				threshold: 0, strength: 1, radius: 0.5, exposure: 1,
+				lineCount: 22, lineThickness: 0.03, lineBrightness: 2.6,
+				diskInner: 2, diskWidth: 4, cameraDistance: 10.69,
+				inclination: 13.24, movementAngle: 12, fieldOfView: 68,
+				orbitSpeed: 0.96, resolutionScale: 0.45
+			} );
+			const saved = JSON.parse( localStorage.getItem( STORAGE_KEY ) || '{}' );
+			const params = { ...defaults, ...saved };
+			if ( params.styleVersion !== defaults.styleVersion ) {
+				Object.assign( params, {
+					styleVersion: defaults.styleVersion,
+					threshold: defaults.threshold,
+					strength: defaults.strength,
+					radius: defaults.radius,
+					exposure: defaults.exposure,
+					lineCount: defaults.lineCount,
+					lineThickness: defaults.lineThickness,
+					lineBrightness: defaults.lineBrightness,
+					resolutionScale: defaults.resolutionScale
+				} );
+				localStorage.setItem( STORAGE_KEY, JSON.stringify( params ) );
+			}
+			// Older saved sessions used a much heavier scale that predates ray marching.
+			if ( Number( saved.resolutionScale ) > 0.7 ) params.resolutionScale = defaults.resolutionScale;
+			const TAU = Math.PI * 2;
+
+			let renderer, scene, mappingScene, blurScene, compositeScene, camera, stats;
+			let mappingMaterial, displayMaterial, blurMaterial, compositeMaterial;
+			let mappingTarget, lineTarget, glowTargetA, glowTargetB, rayMapFrame;
+			let previousTime = performance.now();
+
+			const vertexShader = /* glsl */`
+				varying vec2 vUv;
+				void main() {
+					vUv = uv;
+					gl_Position = vec4( position, 1.0 );
+				}
+			`;
+
+			// This is the same low-quality Schwarzschild integrator used by the
+			// reference simulation. The bright upper arcs are not modeled curves:
+			// each screen ray is bent until it intersects the flat XZ disk at y = 0.
+			const mappingFragmentShader = /* glsl */`
+				#define PI 3.141592653589793238462643383279
+				// Fast sampling of the same geodesic equation. The reference simulation's
+				// low preset also advances photons in 0.1-unit steps.
+				#define STEP 0.1
+				#define NSTEPS 180
+
+				uniform vec2 uResolution;
+				uniform vec3 uCameraPosition;
+				uniform vec3 uCameraDirection;
+				uniform vec3 uCameraUp;
+				uniform vec3 uCameraVelocity;
+				uniform float uFieldOfView;
+				uniform float uDiskInner;
+				uniform float uDiskWidth;
+
+				vec3 lorentzTransformVelocity( vec3 u, vec3 v ) {
+					float speed = length( v );
+					if ( speed > 0.0 ) {
+						float gamma = 1.0 / sqrt( 1.0 - dot( v, v ) );
+						float denominator = 1.0 - dot( v, u );
+						return ( u / gamma - v + ( gamma / ( gamma + 1.0 ) ) * dot( u, v ) * v ) / denominator;
+					}
+					return u;
+				}
+
+				void main() {
+					float uvfov = tan( uFieldOfView * 0.5 * PI / 180.0 );
+					vec2 uv = 2.0 * ( gl_FragCoord.xy / uResolution ) - 1.0;
+					uv *= vec2( uResolution.x / uResolution.y, 1.0 );
+
+					vec3 forward = normalize( uCameraDirection );
+					vec3 up = normalize( uCameraUp );
+					vec3 nright = normalize( cross( forward, up ) );
+					up = cross( nright, forward );
+					vec3 pixelPos = uCameraPosition + forward + nright * uv.x * uvfov + up * uv.y * uvfov;
+					vec3 rayDir = normalize( pixelPos - uCameraPosition );
+					rayDir = lorentzTransformVelocity( rayDir, uCameraVelocity );
+
+					vec3 point = uCameraPosition;
+					vec3 velocity = rayDir;
+					vec3 angularMomentum = cross( point, velocity );
+					float h2 = dot( angularMomentum, angularMomentum );
+					// Rays this far outside the disk cannot create a visible lensed line.
+					// Rejecting them before the loop keeps empty background pixels cheap.
+					if ( sqrt( h2 ) > uDiskInner + uDiskWidth + 2.5 ) {
+						gl_FragColor = vec4( 0.0 );
+						return;
+					}
+					float rayGamma = 1.0 / sqrt( 1.0 - dot( uCameraVelocity, uCameraVelocity ) );
+					float rayDoppler = rayGamma * ( 1.0 + dot( rayDir, -uCameraVelocity ) );
+					float rayIntensity = 1.0 / pow( rayDoppler, 3.0 );
+					vec3 oldpoint;
+
+					for ( int i = 0; i < NSTEPS; i ++ ) {
+						oldpoint = point;
+						point += velocity * STEP;
+						vec3 accel = -1.5 * h2 * point / pow( dot( point, point ), 2.5 );
+						velocity += accel * STEP;
+
+						float distanceFromHole = length( point );
+						if ( distanceFromHole < 1.0 && length( oldpoint ) > 1.0 ) break;
+
+						if ( oldpoint.y * point.y < 0.0 ) {
+							float lambda = -oldpoint.y / velocity.y;
+							vec3 intersection = oldpoint + lambda * velocity;
+							float r = length( intersection );
+							if ( uDiskInner <= r && r <= uDiskInner + uDiskWidth ) {
+								float phi = atan( intersection.x, intersection.z );
+								vec3 diskVelocity = vec3( -intersection.x, 0.0, intersection.z ) /
+									sqrt( 2.0 * ( r - 1.0 ) ) / ( r * r );
+								phi = mod( phi + PI * 2.0, PI * 2.0 );
+								float diskGamma = 1.0 / sqrt( 1.0 - dot( diskVelocity, diskVelocity ) );
+								float diskDoppler = diskGamma * ( 1.0 + dot( rayDir / distanceFromHole, diskVelocity ) );
+								vec2 diskUv = vec2( phi / ( 2.0 * PI ), 1.0 - ( r - uDiskInner ) / uDiskWidth );
+								float gain = rayIntensity / ( rayDoppler * diskDoppler );
+								gl_FragColor = vec4( diskUv, gain, 1.0 );
+								return;
+							}
+						}
+					}
+
+					gl_FragColor = vec4( 0.0 );
+				}
+			`;
+
+			// The expensive geodesic result above is static. Normal animation frames
+			// only move the disk texture through this cached UV map.
+			const displayFragmentShader = /* glsl */`
+				#define PI 3.141592653589793238462643383279
+				varying vec2 vUv;
+				uniform float uTime;
+				uniform float uBrightness;
+				uniform float uThreshold;
+				uniform float uExposure;
+				uniform float uLineCount;
+				uniform float uLineThickness;
+				uniform sampler2D uRayMap;
+
+				float random( float value ) {
+					return fract( sin( value * 12.9898 ) * 43758.5453 );
+				}
+
+				void main() {
+					vec4 rayMap = texture2D( uRayMap, vUv );
+					if ( rayMap.a < 0.5 ) {
+						gl_FragColor = vec4( 0.0, 0.0, 0.0, 1.0 );
+						return;
+					}
+					float laneCoordinate = rayMap.y * ( uLineCount + 1.0 );
+					float laneIndex = floor( laneCoordinate + 0.5 );
+					float validLane = step( 0.5, laneIndex ) * step( laneIndex, uLineCount + 0.5 );
+					float radialDistance = abs( laneCoordinate - laneIndex ) / ( uLineCount + 1.0 );
+					float halfWidth = 0.00065 + uLineThickness * 0.009;
+					float antialiasWidth = max( fwidth( rayMap.y ) * 1.25, 0.00035 );
+					float coreMask = 1.0 - smoothstep( halfWidth - antialiasWidth, halfWidth + antialiasWidth, radialDistance );
+
+					// Every lane has stable random segment lengths, gaps, speed and direction.
+					// Moving disk azimuth through this pattern makes the motion unmistakable.
+					float laneSeed = laneIndex * 19.731;
+					float direction = random( laneSeed + 2.0 ) > 0.42 ? 1.0 : -1.0;
+					float speed = mix( 0.55, 1.35, random( laneSeed + 4.0 ) );
+					float timePhase = mod( uTime, PI * 2.0 ) / ( PI * 2.0 );
+					float movingPhi = fract( rayMap.x - direction * timePhase * speed + random( laneSeed + 6.0 ) );
+					float segmentCount = floor( mix( 5.0, 12.0, random( laneSeed + 8.0 ) ) );
+					float segmentCoordinate = movingPhi * segmentCount;
+					float cell = floor( segmentCoordinate );
+					float localPosition = fract( segmentCoordinate );
+					float cellSeed = laneSeed + cell * 31.417;
+					float segmentStart = mix( 0.025, 0.16, random( cellSeed + 10.0 ) );
+					float segmentLength = mix( 0.24, 0.82, random( cellSeed + 12.0 ) );
+					float segmentEnd = min( 0.97, segmentStart + segmentLength );
+					float endFeather = max( fwidth( segmentCoordinate ) * 1.25, 0.012 );
+					float segmentMask = smoothstep( segmentStart - endFeather, segmentStart + endFeather, localPosition ) *
+						( 1.0 - smoothstep( segmentEnd - endFeather, segmentEnd + endFeather, localPosition ) );
+					float core = smoothstep( uThreshold, 1.0, coreMask * segmentMask ) * validLane * uBrightness;
+					float intensity = core * rayMap.z * uExposure;
+					float monochrome = 1.0 - exp( -intensity );
+					gl_FragColor = vec4( vec3( monochrome ), 1.0 );
+				}
+			`;
+
+			// A true Gaussian bloom, evaluated on half-resolution buffers. The same
+			// five-tap shader is applied horizontally and vertically.
+			const blurFragmentShader = /* glsl */`
+				varying vec2 vUv;
+				uniform sampler2D uInput;
+				uniform vec2 uDirection;
+
+				void main() {
+					vec3 color = texture2D( uInput, vUv ).rgb * 0.227027;
+					color += texture2D( uInput, vUv + uDirection * 1.384615 ).rgb * 0.316216;
+					color += texture2D( uInput, vUv - uDirection * 1.384615 ).rgb * 0.316216;
+					color += texture2D( uInput, vUv + uDirection * 3.230769 ).rgb * 0.070270;
+					color += texture2D( uInput, vUv - uDirection * 3.230769 ).rgb * 0.070270;
+					gl_FragColor = vec4( color, 1.0 );
+				}
+			`;
+
+			const compositeFragmentShader = /* glsl */`
+				varying vec2 vUv;
+				uniform sampler2D uLines;
+				uniform sampler2D uGlow;
+				uniform float uGlowStrength;
+
+				void main() {
+					vec3 core = texture2D( uLines, vUv ).rgb;
+					vec3 bloom = texture2D( uGlow, vUv ).rgb;
+					gl_FragColor = vec4( min( vec3( 1.0 ), core + bloom * uGlowStrength * 2.5 ), 1.0 );
+				}
+			`;
+
+			function updateCameraUniforms() {
+				const distance = params.cameraDistance;
+				const incline = THREE.MathUtils.degToRad( params.inclination );
+				const pathAngle = THREE.MathUtils.degToRad( params.movementAngle );
+				const orbitY = Math.sin( incline ) * distance;
+				const orbitZ = Math.cos( incline ) * distance;
+				const position = mappingMaterial.uniforms.uCameraPosition.value;
+				position.set( -orbitY * Math.sin( pathAngle ), orbitY * Math.cos( pathAngle ), orbitZ );
+				mappingMaterial.uniforms.uCameraDirection.value.copy( position ).multiplyScalar( -1 ).normalize();
+				const right = new THREE.Vector3().crossVectors( mappingMaterial.uniforms.uCameraDirection.value, new THREE.Vector3( 0, 1, 0 ) ).normalize();
+				mappingMaterial.uniforms.uCameraUp.value.crossVectors( right, mappingMaterial.uniforms.uCameraDirection.value ).normalize();
+				mappingMaterial.uniforms.uCameraVelocity.value.set( Math.cos( pathAngle ), Math.sin( pathAngle ), 0 ).multiplyScalar( 0.42 * 0.022 );
+				mappingMaterial.uniforms.uFieldOfView.value = params.fieldOfView;
+				mappingMaterial.uniforms.uDiskInner.value = params.diskInner;
+				mappingMaterial.uniforms.uDiskWidth.value = params.diskWidth;
+			}
+
+			function rebuildRayMap() {
+				if ( ! renderer || ! mappingTarget ) return;
+				const previousTarget = renderer.getRenderTarget();
+				renderer.setRenderTarget( mappingTarget );
+				renderer.clear();
+				renderer.render( mappingScene, camera );
+				renderer.setRenderTarget( previousTarget );
+			}
+
+			function scheduleRayMap() {
+				if ( rayMapFrame ) return;
+				rayMapFrame = requestAnimationFrame( () => {
+					rayMapFrame = 0;
+					rebuildRayMap();
+				} );
+			}
+
+			function updateSimulation() {
+				updateCameraUniforms();
+				scheduleRayMap();
+			}
+
+			function updateLineStyle() {
+				displayMaterial.uniforms.uLineCount.value = Math.round( params.lineCount );
+				displayMaterial.uniforms.uLineThickness.value = params.lineThickness;
+			}
+
+			function saveAndApply( action = updateSimulation ) {
+				localStorage.setItem( STORAGE_KEY, JSON.stringify( params ) );
+				action();
+			}
+
+			function addControl( folder, key, label, min, max, step, action = updateSimulation ) {
+				return folder.add( params, key, min, max, step ).name( label ).onChange( () => saveAndApply( action ) );
+			}
+
+			function init() {
+				const container = document.getElementById( 'container' );
+				scene = new THREE.Scene();
+				scene.background = new THREE.Color( 0x000000 );
+				mappingScene = new THREE.Scene();
+				blurScene = new THREE.Scene();
+				compositeScene = new THREE.Scene();
+				camera = new THREE.OrthographicCamera( -1, 1, 1, -1, 0, 1 );
+
+				mappingMaterial = new THREE.ShaderMaterial( {
+					vertexShader,
+					fragmentShader: mappingFragmentShader,
+					depthTest: false,
+					depthWrite: false,
+					uniforms: {
+						uResolution: { value: new THREE.Vector2() },
+						uCameraPosition: { value: new THREE.Vector3() },
+						uCameraDirection: { value: new THREE.Vector3() },
+						uCameraUp: { value: new THREE.Vector3() },
+						uCameraVelocity: { value: new THREE.Vector3() },
+						uFieldOfView: { value: params.fieldOfView },
+						uDiskInner: { value: params.diskInner },
+						uDiskWidth: { value: params.diskWidth }
+					}
+				} );
+				mappingScene.add( new THREE.Mesh( new THREE.PlaneGeometry( 2, 2 ), mappingMaterial ) );
+				displayMaterial = new THREE.ShaderMaterial( {
+					vertexShader,
+					fragmentShader: displayFragmentShader,
+					depthTest: false,
+					depthWrite: false,
+					uniforms: {
+						uTime: { value: 0 },
+						uBrightness: { value: params.lineBrightness },
+						uThreshold: { value: params.threshold },
+						uExposure: { value: params.exposure },
+						uLineCount: { value: Math.round( params.lineCount ) },
+						uLineThickness: { value: params.lineThickness },
+						uRayMap: { value: null },
+					}
+				} );
+				scene.add( new THREE.Mesh( new THREE.PlaneGeometry( 2, 2 ), displayMaterial ) );
+				blurMaterial = new THREE.ShaderMaterial( {
+					vertexShader,
+					fragmentShader: blurFragmentShader,
+					depthTest: false,
+					depthWrite: false,
+					uniforms: {
+						uInput: { value: null },
+						uDirection: { value: new THREE.Vector2() }
+					}
+				} );
+				blurScene.add( new THREE.Mesh( new THREE.PlaneGeometry( 2, 2 ), blurMaterial ) );
+				compositeMaterial = new THREE.ShaderMaterial( {
+					vertexShader,
+					fragmentShader: compositeFragmentShader,
+					depthTest: false,
+					depthWrite: false,
+					uniforms: {
+						uLines: { value: null },
+						uGlow: { value: null },
+						uGlowStrength: { value: params.strength }
+					}
+				} );
+				compositeScene.add( new THREE.Mesh( new THREE.PlaneGeometry( 2, 2 ), compositeMaterial ) );
+				updateCameraUniforms();
+
+				renderer = new THREE.WebGLRenderer( { antialias: false, powerPreference: 'high-performance' } );
+				renderer.setPixelRatio( Math.min( devicePixelRatio, params.resolutionScale ) );
+				renderer.setSize( innerWidth, innerHeight );
+				container.appendChild( renderer.domElement );
+
+				stats = new Stats();
+				container.appendChild( stats.dom );
+
+				const gui = new GUI();
+				const pathFolder = gui.addFolder( 'simulation path' );
+				addControl( pathFolder, 'lineCount', 'line count', 1, 30, 1, updateLineStyle );
+				addControl( pathFolder, 'lineThickness', 'line thickness', 0.01, 0.5, 0.01, updateLineStyle );
+				addControl( pathFolder, 'diskInner', 'inner radius', 1.05, 5, 0.01 );
+				addControl( pathFolder, 'diskWidth', 'disk width', 0.25, 8, 0.01 );
+				addControl( pathFolder, 'orbitSpeed', 'path speed', -3, 3, 0.01, () => {} );
+
+				const viewFolder = gui.addFolder( 'lensing view' );
+				addControl( viewFolder, 'cameraDistance', 'camera distance', 4, 24, 0.01 );
+				addControl( viewFolder, 'inclination', 'inclination', 0.1, 45, 0.01 );
+				addControl( viewFolder, 'movementAngle', 'view rotation', -90, 90, 0.01 );
+				addControl( viewFolder, 'fieldOfView', 'field of view', 25, 110, 0.1 );
+				addControl( viewFolder, 'lineBrightness', 'brightness', 0.1, 6, 0.01, () => displayMaterial.uniforms.uBrightness.value = params.lineBrightness );
+
+				const bloomFolder = gui.addFolder( 'bloom' );
+				addControl( bloomFolder, 'threshold', 'threshold', 0, 1, 0.01, () => displayMaterial.uniforms.uThreshold.value = params.threshold );
+				addControl( bloomFolder, 'strength', 'strength', 0, 3, 0.01, () => compositeMaterial.uniforms.uGlowStrength.value = params.strength );
+				addControl( bloomFolder, 'radius', 'radius', 0, 1, 0.01, () => {} );
+				addControl( bloomFolder, 'exposure', 'exposure', 0.1, 2, 0.01, () => displayMaterial.uniforms.uExposure.value = params.exposure );
+
+				const performanceFolder = gui.addFolder( 'performance' );
+				addControl( performanceFolder, 'resolutionScale', 'render scale', 0.3, 0.7, 0.01, onWindowResize );
+
+				const actions = {
+					reset() {
+						Object.assign( params, defaults );
+						localStorage.removeItem( STORAGE_KEY );
+						gui.controllersRecursive().forEach( ( controller ) => controller.updateDisplay() );
+						updateLineStyle();
+						updateCameraUniforms();
+						displayMaterial.uniforms.uBrightness.value = params.lineBrightness;
+						displayMaterial.uniforms.uThreshold.value = params.threshold;
+						compositeMaterial.uniforms.uGlowStrength.value = params.strength;
+						displayMaterial.uniforms.uExposure.value = params.exposure;
+						onWindowResize();
+					}
+				};
+				gui.add( actions, 'reset' ).name( 'reset saved values' );
+
+				addEventListener( 'resize', onWindowResize );
+				onWindowResize();
+				renderer.setAnimationLoop( animate );
+			}
+
+			function onWindowResize() {
+				renderer.setPixelRatio( Math.min( devicePixelRatio, params.resolutionScale ) );
+				renderer.setSize( innerWidth, innerHeight );
+				const size = renderer.getDrawingBufferSize( new THREE.Vector2() );
+				mappingMaterial.uniforms.uResolution.value.copy( size );
+				mappingTarget?.dispose();
+				mappingTarget = new THREE.WebGLRenderTarget( size.x, size.y, {
+					type: THREE.HalfFloatType,
+					format: THREE.RGBAFormat,
+					minFilter: THREE.LinearFilter,
+					magFilter: THREE.LinearFilter,
+					depthBuffer: false,
+					stencilBuffer: false
+				} );
+				lineTarget?.dispose();
+				lineTarget = new THREE.WebGLRenderTarget( size.x, size.y, {
+					format: THREE.RGBAFormat,
+					minFilter: THREE.LinearFilter,
+					magFilter: THREE.LinearFilter,
+					depthBuffer: false,
+					stencilBuffer: false
+				} );
+				const glowWidth = Math.max( 1, Math.floor( size.x * 0.5 ) );
+				const glowHeight = Math.max( 1, Math.floor( size.y * 0.5 ) );
+				glowTargetA?.dispose();
+				glowTargetB?.dispose();
+				glowTargetA = new THREE.WebGLRenderTarget( glowWidth, glowHeight, {
+					format: THREE.RGBAFormat,
+					minFilter: THREE.LinearFilter,
+					magFilter: THREE.LinearFilter,
+					depthBuffer: false,
+					stencilBuffer: false
+				} );
+				glowTargetB = glowTargetA.clone();
+				displayMaterial.uniforms.uRayMap.value = mappingTarget.texture;
+				compositeMaterial.uniforms.uLines.value = lineTarget.texture;
+				compositeMaterial.uniforms.uGlow.value = glowTargetB.texture;
+				rebuildRayMap();
+			}
+
+			function animate( now ) {
+				const delta = Math.min( 0.05, Math.max( 0, ( now - previousTime ) / 1000 ) );
+				previousTime = now;
+				displayMaterial.uniforms.uTime.value = ( displayMaterial.uniforms.uTime.value + delta * params.orbitSpeed ) % TAU;
+				stats.update();
+				renderer.setRenderTarget( lineTarget );
+				renderer.render( scene, camera );
+
+				const blurSpread = THREE.MathUtils.lerp( 2.5, 8, params.radius );
+				blurMaterial.uniforms.uInput.value = lineTarget.texture;
+				blurMaterial.uniforms.uDirection.value.set( blurSpread / lineTarget.width, 0 );
+				renderer.setRenderTarget( glowTargetA );
+				renderer.render( blurScene, camera );
+
+				blurMaterial.uniforms.uInput.value = glowTargetA.texture;
+				blurMaterial.uniforms.uDirection.value.set( 0, blurSpread * 0.5 / glowTargetA.height );
+				renderer.setRenderTarget( glowTargetB );
+				renderer.render( blurScene, camera );
+
+				renderer.setRenderTarget( null );
+				renderer.render( compositeScene, camera );
+			}
+
+			init();
+		</script>
+	</body>
+</html>
