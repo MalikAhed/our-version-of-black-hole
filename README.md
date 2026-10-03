@@ -30,3 +30,10 @@ when the browser tab is hidden.
 
 The Git tag `pre-official-unreal-bloom` restores the state immediately before
 the official bloom integration.
+
+## License
+
+Original contributions by Malik Abuallatta are licensed under the
+[MIT License](LICENSE). Third-party code, adaptations, dependencies, and assets
+retain their existing licenses and notices. This license does not grant new
+rights to third-party material.
