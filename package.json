@@ -2,7 +2,16 @@
   "name": "our-version-of-black-hole",
   "version": "1.0.0",
   "private": true,
+  "description": "Standalone Three.js Schwarzschild line-path simulation and bloom editor.",
   "type": "module",
+  "keywords": [
+    "three.js",
+    "webgl",
+    "black-hole",
+    "simulation",
+    "graphics"
+  ],
+  "author": "Malik Abuallatta",
   "scripts": {
     "start": "node server.mjs",
     "check": "node --check server.mjs"
